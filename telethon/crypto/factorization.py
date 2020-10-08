@@ -13,6 +13,8 @@ class Factorization:
         """
         Factorizes the given large integer.
 
+        Implementation from https://comeoncodeon.wordpress.com/2010/09/18/pollard-rho-brent-integer-factorization/.
+
         :param pq: the prime pair pq.
         :return: a tuple containing the two factors p and q.
         """
@@ -47,7 +49,8 @@ class Factorization:
                 if g > 1:
                     break
 
-        return g, pq // g
+        p, q = g, pq // g
+        return (p, q) if p < q else (q, p)
 
     @staticmethod
     def gcd(a, b):

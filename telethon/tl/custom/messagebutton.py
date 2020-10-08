@@ -1,13 +1,20 @@
 from .. import types, functions
-from ...errors import BotTimeout
+from ...errors import BotResponseTimeoutError
 import webbrowser
 
 
 class MessageButton:
     """
-    Custom class that encapsulates a message providing an abstraction to
-    easily access some commonly needed features (such as the markdown text
-    or the text for a given message entity).
+    .. note::
+
+        `Message.buttons <telethon.tl.custom.message.Message.buttons>`
+        are instances of this type. If you want to **define** a reply
+        markup for e.g. sending messages, refer to `Button
+        <telethon.tl.custom.button.Button>` instead.
+
+    Custom class that encapsulates a message button providing
+    an abstraction to easily access some commonly needed features
+    (such as clicking the button itself).
 
     Attributes:
 
@@ -24,8 +31,8 @@ class MessageButton:
     @property
     def client(self):
         """
-        Returns the `telethon.telegram_client.TelegramClient` instance that
-        created this instance.
+        Returns the `telethon.client.telegramclient.TelegramClient`
+        instance that created this instance.
         """
         return self._client
 
@@ -36,28 +43,28 @@ class MessageButton:
 
     @property
     def data(self):
-        """The ``bytes`` data for :tl:`KeyboardButtonCallback` objects."""
+        """The `bytes` data for :tl:`KeyboardButtonCallback` objects."""
         if isinstance(self.button, types.KeyboardButtonCallback):
             return self.button.data
 
     @property
     def inline_query(self):
-        """The query ``str`` for :tl:`KeyboardButtonSwitchInline` objects."""
+        """The query `str` for :tl:`KeyboardButtonSwitchInline` objects."""
         if isinstance(self.button, types.KeyboardButtonSwitchInline):
             return self.button.query
 
     @property
     def url(self):
-        """The url ``str`` for :tl:`KeyboardButtonUrl` objects."""
+        """The url `str` for :tl:`KeyboardButtonUrl` objects."""
         if isinstance(self.button, types.KeyboardButtonUrl):
             return self.button.url
 
-    async def click(self):
+    async def click(self, share_phone=None, share_geo=None):
         """
         Emulates the behaviour of clicking this button.
 
         If it's a normal :tl:`KeyboardButton` with text, a message will be
-        sent, and the sent `telethon.tl.custom.message.Message` returned.
+        sent, and the sent `Message <telethon.tl.custom.message.Message>` returned.
 
         If it's an inline :tl:`KeyboardButtonCallback` with text and data,
         it will be "clicked" and the :tl:`BotCallbackAnswer` returned.
@@ -67,18 +74,31 @@ class MessageButton:
         returned.
 
         If it's a :tl:`KeyboardButtonUrl`, the URL of the button will
-        be passed to ``webbrowser.open`` and return ``True`` on success.
+        be passed to ``webbrowser.open`` and return `True` on success.
+
+        If it's a :tl:`KeyboardButtonRequestPhone`, you must indicate that you
+        want to ``share_phone=True`` in order to share it. Sharing it is not a
+        default because it is a privacy concern and could happen accidentally.
+
+        You may also use ``share_phone=phone`` to share a specific number, in
+        which case either `str` or :tl:`InputMediaContact` should be used.
+
+        If it's a :tl:`KeyboardButtonRequestGeoLocation`, you must pass a
+        tuple in ``share_geo=(longitude, latitude)``. Note that Telegram seems
+        to have some heuristics to determine impossible locations, so changing
+        this value a lot quickly may not work as expected. You may also pass a
+        :tl:`InputGeoPoint` if you find the order confusing.
         """
         if isinstance(self.button, types.KeyboardButton):
             return await self._client.send_message(
-                self._chat, self.button.text, reply_to=self._msg_id)
+                self._chat, self.button.text, parse_mode=None)
         elif isinstance(self.button, types.KeyboardButtonCallback):
             req = functions.messages.GetBotCallbackAnswerRequest(
                 peer=self._chat, msg_id=self._msg_id, data=self.button.data
             )
             try:
                 return await self._client(req)
-            except BotTimeout:
+            except BotResponseTimeoutError:
                 return None
         elif isinstance(self.button, types.KeyboardButtonSwitchInline):
             return await self._client(functions.messages.StartBotRequest(
@@ -86,3 +106,34 @@ class MessageButton:
             ))
         elif isinstance(self.button, types.KeyboardButtonUrl):
             return webbrowser.open(self.button.url)
+        elif isinstance(self.button, types.KeyboardButtonGame):
+            req = functions.messages.GetBotCallbackAnswerRequest(
+                peer=self._chat, msg_id=self._msg_id, game=True
+            )
+            try:
+                return await self._client(req)
+            except BotResponseTimeoutError:
+                return None
+        elif isinstance(self.button, types.KeyboardButtonRequestPhone):
+            if not share_phone:
+                raise ValueError('cannot click on phone buttons unless share_phone=True')
+
+            if share_phone == True or isinstance(share_phone, str):
+                me = await self._client.get_me()
+                share_phone = types.InputMediaContact(
+                    phone_number=me.phone if share_phone == True else share_phone,
+                    first_name=me.first_name or '',
+                    last_name=me.last_name or '',
+                    vcard=''
+                )
+
+            return await self._client.send_file(self._chat, share_phone)
+        elif isinstance(self.button, types.KeyboardButtonRequestGeoLocation):
+            if not share_geo:
+                raise ValueError('cannot click on geo buttons unless share_geo=(longitude, latitude)')
+
+            if isinstance(share_geo, (tuple, list)):
+                long, lat = share_geo
+                share_geo = types.InputMediaGeoPoint(types.InputGeoPoint(lat=lat, long=long))
+
+            return await self._client.send_file(self._chat, share_geo)
