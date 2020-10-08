@@ -1,57 +1,75 @@
 import re
 
 from .common import EventBuilder, EventCommon, name_inner_event, _into_id_set
-from ..tl import types, custom
+from .. import utils
+from ..tl import types
 
 
 @name_inner_event
 class NewMessage(EventBuilder):
     """
-    Represents a new message event builder.
+    Occurs whenever a new text message or a message with media arrives.
 
     Args:
         incoming (`bool`, optional):
-            If set to ``True``, only **incoming** messages will be handled.
+            If set to `True`, only **incoming** messages will be handled.
             Mutually exclusive with ``outgoing`` (can only set one of either).
 
         outgoing (`bool`, optional):
-            If set to ``True``, only **outgoing** messages will be handled.
+            If set to `True`, only **outgoing** messages will be handled.
             Mutually exclusive with ``incoming`` (can only set one of either).
 
         from_users (`entity`, optional):
-            Unlike `chats`, this parameter filters the *sender* of the message.
-            That is, only messages *sent by this user* will be handled. Use
-            `chats` if you want private messages with this/these users.
-            `from_users` lets you filter by messages sent by one or more users
-            across the desired chats.
+            Unlike `chats`, this parameter filters the *senders* of the
+            message. That is, only messages *sent by these users* will be
+            handled. Use `chats` if you want private messages with this/these
+            users. `from_users` lets you filter by messages sent by *one or
+            more* users across the desired chats (doesn't need a list).
 
         forwards (`bool`, optional):
             Whether forwarded messages should be handled or not. By default,
-            both forwarded and normal messages are included. If it's ``True``
-            *only* forwards will be handled. If it's ``False`` only messages
+            both forwarded and normal messages are included. If it's `True`
+            *only* forwards will be handled. If it's `False` only messages
             that are *not* forwards will be handled.
 
         pattern (`str`, `callable`, `Pattern`, optional):
             If set, only messages matching this pattern will be handled.
             You can specify a regex-like string which will be matched
-            against the message, a callable function that returns ``True``
+            against the message, a callable function that returns `True`
             if a message is acceptable, or a compiled regex pattern.
+
+    Example
+        .. code-block:: python
+
+            import asyncio
+            from telethon import events
+
+            @client.on(events.NewMessage(pattern='(?i)hello.+'))
+            async def handler(event):
+                # Respond whenever someone says "Hello" and something else
+                await event.reply('Hey!')
+
+            @client.on(events.NewMessage(outgoing=True, pattern='!ping'))
+            async def handler(event):
+                # Say "!pong" whenever you send "!ping", then delete both messages
+                m = await event.respond('!pong')
+                await asyncio.sleep(5)
+                await client.delete_messages(event.chat_id, [event.id, m.id])
     """
-    def __init__(self, chats=None, *, blacklist_chats=False,
+    def __init__(self, chats=None, *, blacklist_chats=False, func=None,
                  incoming=None, outgoing=None,
                  from_users=None, forwards=None, pattern=None):
-        if incoming is not None and outgoing is None:
+        if incoming and outgoing:
+            incoming = outgoing = None  # Same as no filter
+        elif incoming is not None and outgoing is None:
             outgoing = not incoming
         elif outgoing is not None and incoming is None:
             incoming = not outgoing
-
-        if incoming and outgoing:
-            self.incoming = self.outgoing = None  # Same as no filter
         elif all(x is not None and not x for x in (incoming, outgoing)):
             raise ValueError("Don't create an event handler if you "
-                             "don't want neither incoming or outgoing!")
+                             "don't want neither incoming nor outgoing!")
 
-        super().__init__(chats=chats, blacklist_chats=blacklist_chats)
+        super().__init__(chats, blacklist_chats=blacklist_chats, func=func)
         self.incoming = incoming
         self.outgoing = outgoing
         self.from_users = from_users
@@ -68,15 +86,15 @@ class NewMessage(EventBuilder):
         # Should we short-circuit? E.g. perform no check at all
         self._no_check = all(x is None for x in (
             self.chats, self.incoming, self.outgoing, self.pattern,
-            self.from_users, self.forwards, self.from_users
+            self.from_users, self.forwards, self.from_users, self.func
         ))
 
-    async def resolve(self, client):
-        await super().resolve(client)
+    async def _resolve(self, client):
+        await super()._resolve(client)
         self.from_users = await _into_id_set(client, self.from_users)
 
     @classmethod
-    def build(cls, update):
+    def build(cls, update, others=None, self_id=None):
         if isinstance(update,
                       (types.UpdateNewMessage, types.UpdateNewChannelMessage)):
             if not isinstance(update.message, types.Message):
@@ -89,17 +107,13 @@ class NewMessage(EventBuilder):
                 media_unread=update.media_unread,
                 silent=update.silent,
                 id=update.id,
-                # Note that to_id/from_id complement each other in private
-                # messages, depending on whether the message was outgoing.
-                to_id=types.PeerUser(
-                    update.user_id if update.out else cls.self_id
-                ),
-                from_id=cls.self_id if update.out else update.user_id,
+                peer_id=types.PeerUser(update.user_id),
+                from_id=types.PeerUser(self_id if update.out else update.user_id),
                 message=update.message,
                 date=update.date,
                 fwd_from=update.fwd_from,
                 via_bot_id=update.via_bot_id,
-                reply_to_msg_id=update.reply_to_msg_id,
+                reply_to=update.reply_to,
                 entities=update.entities
             ))
         elif isinstance(update, types.UpdateShortChatMessage):
@@ -109,13 +123,13 @@ class NewMessage(EventBuilder):
                 media_unread=update.media_unread,
                 silent=update.silent,
                 id=update.id,
-                from_id=update.from_id,
-                to_id=types.PeerChat(update.chat_id),
+                from_id=types.PeerUser(self_id if update.out else update.from_id),
+                peer_id=types.PeerChat(update.chat_id),
                 message=update.message,
                 date=update.date,
                 fwd_from=update.fwd_from,
                 via_bot_id=update.via_bot_id,
-                reply_to_msg_id=update.reply_to_msg_id,
+                reply_to=update.reply_to,
                 entities=update.entities
             ))
         else:
@@ -124,11 +138,9 @@ class NewMessage(EventBuilder):
         # Make messages sent to ourselves outgoing unless they're forwarded.
         # This makes it consistent with official client's appearance.
         ori = event.message
-        if isinstance(ori.to_id, types.PeerUser):
-            if ori.from_id == ori.to_id.user_id and not ori.fwd_from:
-                event.message.out = True
+        if ori.peer_id == types.PeerUser(self_id) and not ori.fwd_from:
+            event.message.out = True
 
-        event._entities = update._entities
         return event
 
     def filter(self, event):
@@ -144,7 +156,7 @@ class NewMessage(EventBuilder):
                 return
 
         if self.from_users is not None:
-            if event.message.from_id not in self.from_users:
+            if event.message.sender_id not in self.from_users:
                 return
 
         if self.pattern:
@@ -158,18 +170,19 @@ class NewMessage(EventBuilder):
     class Event(EventCommon):
         """
         Represents the event of a new message. This event can be treated
-        to all effects as a `telethon.tl.custom.message.Message`, so please
-        **refer to its documentation** to know what you can do with this event.
+        to all effects as a `Message <telethon.tl.custom.message.Message>`,
+        so please **refer to its documentation** to know what you can do
+        with this event.
 
         Members:
-            message (:tl:`Message`):
+            message (`Message <telethon.tl.custom.message.Message>`):
                 This is the only difference with the received
-                `telethon.tl.custom.message.Message`, and will
+                `Message <telethon.tl.custom.message.Message>`, and will
                 return the `telethon.tl.custom.message.Message` itself,
                 not the text.
 
-                See `telethon.tl.custom.message.Message` for the rest of
-                available members and methods.
+                See `Message <telethon.tl.custom.message.Message>` for
+                the rest of available members and methods.
 
             pattern_match (`obj`):
                 The resulting object from calling the passed ``pattern`` function.
@@ -181,7 +194,7 @@ class NewMessage(EventBuilder):
                 >>> @client.on(events.NewMessage(pattern=r'hi (\\w+)!'))
                 ... async def handler(event):
                 ...     # In this case, the result is a ``Match`` object
-                ...     # since the ``str`` pattern was converted into
+                ...     # since the `str` pattern was converted into
                 ...     # the ``re.compile(pattern).match`` function.
                 ...     print('Welcomed', event.pattern_match.group(1))
                 ...
@@ -189,14 +202,7 @@ class NewMessage(EventBuilder):
         """
         def __init__(self, message):
             self.__dict__['_init'] = False
-            if not message.out and isinstance(message.to_id, types.PeerUser):
-                # Incoming message (e.g. from a bot) has to_id=us, and
-                # from_id=bot (the actual "chat" from an user's perspective).
-                chat_peer = types.PeerUser(message.from_id)
-            else:
-                chat_peer = message.to_id
-
-            super().__init__(chat_peer=chat_peer,
+            super().__init__(chat_peer=message.peer_id,
                              msg_id=message.id, broadcast=bool(message.post))
 
             self.pattern_match = None
@@ -204,7 +210,8 @@ class NewMessage(EventBuilder):
 
         def _set_client(self, client):
             super()._set_client(client)
-            self.message._finish_init(client, self._entities, None)
+            m = self.message
+            m._finish_init(client, self._entities, None)
             self.__dict__['_init'] = True  # No new attributes can be set
 
         def __getattr__(self, item):

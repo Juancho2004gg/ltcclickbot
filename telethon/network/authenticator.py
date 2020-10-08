@@ -10,7 +10,7 @@ from ..tl.types import (
     ResPQ, PQInnerData, ServerDHParamsFail, ServerDHParamsOk,
     ServerDHInnerData, ClientDHInnerData, DhGenOk, DhGenRetry, DhGenFail
 )
-from .. import helpers as utils
+from .. import helpers
 from ..crypto import AES, AuthKey, Factorization, rsa
 from ..errors import SecurityError
 from ..extensions import BinaryReader
@@ -38,7 +38,7 @@ async def do_authentication(sender):
 
     # Step 2 sending: DH Exchange
     p, q = Factorization.factorize(pq)
-    p, q = rsa.get_byte_array(min(p, q)), rsa.get_byte_array(max(p, q))
+    p, q = rsa.get_byte_array(p), rsa.get_byte_array(q)
     new_nonce = int.from_bytes(os.urandom(32), 'little', signed=True)
 
     pq_inner_data = bytes(PQInnerData(
@@ -55,6 +55,14 @@ async def do_authentication(sender):
         if cipher_text is not None:
             target_fingerprint = fingerprint
             break
+
+    if cipher_text is None:
+        # Second attempt, but now we're allowed to use old keys
+        for fingerprint in res_pq.server_public_key_fingerprints:
+            cipher_text = rsa.encrypt(fingerprint, pq_inner_data, use_old=True)
+            if cipher_text is not None:
+                target_fingerprint = fingerprint
+                break
 
     if cipher_text is None:
         raise SecurityError(
@@ -94,7 +102,7 @@ async def do_authentication(sender):
         'Step 2.2 answer was %s' % server_dh_params
 
     # Step 3 sending: Complete DH Exchange
-    key, iv = utils.generate_key_data_from_nonce(
+    key, iv = helpers.generate_key_data_from_nonce(
         res_pq.server_nonce, new_nonce
     )
     if len(server_dh_params.encrypted_answer) % 16 != 0:
@@ -118,19 +126,42 @@ async def do_authentication(sender):
         raise SecurityError('Step 3 Invalid server nonce in encrypted answer')
 
     dh_prime = get_int(server_dh_inner.dh_prime, signed=False)
+    g = server_dh_inner.g
     g_a = get_int(server_dh_inner.g_a, signed=False)
     time_offset = server_dh_inner.server_time - int(time.time())
 
     b = get_int(os.urandom(256), signed=False)
-    gb = pow(server_dh_inner.g, b, dh_prime)
+    g_b = pow(g, b, dh_prime)
     gab = pow(g_a, b, dh_prime)
+
+    # IMPORTANT: Apart from the conditions on the Diffie-Hellman prime
+    # dh_prime and generator g, both sides are to check that g, g_a and
+    # g_b are greater than 1 and less than dh_prime - 1. We recommend
+    # checking that g_a and g_b are between 2^{2048-64} and
+    # dh_prime - 2^{2048-64} as well.
+    # (https://core.telegram.org/mtproto/auth_key#dh-key-exchange-complete)
+    if not (1 < g < (dh_prime - 1)):
+        raise SecurityError('g_a is not within (1, dh_prime - 1)')
+
+    if not (1 < g_a < (dh_prime - 1)):
+        raise SecurityError('g_a is not within (1, dh_prime - 1)')
+
+    if not (1 < g_b < (dh_prime - 1)):
+        raise SecurityError('g_b is not within (1, dh_prime - 1)')
+
+    safety_range = 2 ** (2048 - 64)
+    if not (safety_range <= g_a <= (dh_prime - safety_range)):
+        raise SecurityError('g_a is not within (2^{2048-64}, dh_prime - 2^{2048-64})')
+
+    if not (safety_range <= g_b <= (dh_prime - safety_range)):
+        raise SecurityError('g_b is not within (2^{2048-64}, dh_prime - 2^{2048-64})')
 
     # Prepare client DH Inner Data
     client_dh_inner = bytes(ClientDHInnerData(
         nonce=res_pq.nonce,
         server_nonce=res_pq.server_nonce,
         retry_id=0,  # TODO Actual retry ID
-        g_b=rsa.get_byte_array(gb)
+        g_b=rsa.get_byte_array(g_b)
     ))
 
     client_dh_inner_hashed = sha1(client_dh_inner).digest() + client_dh_inner
@@ -163,7 +194,9 @@ async def do_authentication(sender):
     if dh_hash != new_nonce_hash:
         raise SecurityError('Step 3 invalid new nonce hash')
 
-    assert isinstance(dh_gen, DhGenOk), 'Step 3.2 answer was %s' % dh_gen
+    if not isinstance(dh_gen, DhGenOk):
+        raise AssertionError('Step 3.2 answer was %s' % dh_gen)
+
     return auth_key, time_offset
 
 
